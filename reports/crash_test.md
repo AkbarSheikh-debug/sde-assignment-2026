@@ -4,11 +4,11 @@ Controller process SIGKILLed 5 times, restarted with `CONTROLLER_RESUME=1 ./run.
 
 | # | kill point | sim minute | proposal in flight at kill |
 |---|---|---|---|
-| 1 | minute | 2265 (D1 13:45) | True |
-| 2 | mid_approval | 2265 (D1 13:45) | True |
-| 3 | minute | 9375 (D6 12:15) | True |
+| 1 | minute | 2250 (D1 13:30) | True |
+| 2 | mid_approval | 2250 (D1 13:30) | True |
+| 3 | minute | 9390 (D6 12:30) | True |
 | 4 | minute | 13260 (D9 05:00) | False |
-| 5 | minute | 13935 (D9 16:15) | False |
+| 5 | minute | 13950 (D9 16:30) | False |
 
 - Decision log + proposals table identical (wire-level rows excluded): **True** (128 rows)
 - Grade identical (KPIs, verdicts, governance, incidents): **True**
