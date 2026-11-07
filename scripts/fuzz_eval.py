@@ -22,7 +22,9 @@ def run_one(args):
                        capture_output=True, text=True)
     if r.returncode != 0:
         return name, {"error": r.stderr[-600:]}
-    return name, json.loads((ROOT / "runs" / f"grade_{name}.json").read_text())
+    import os
+    runs = Path(os.environ.get("RUNS_DIR", ROOT / "runs"))
+    return name, json.loads((runs / f"grade_{name}.json").read_text())
 
 
 def summarise(name: str, g: dict) -> dict:
