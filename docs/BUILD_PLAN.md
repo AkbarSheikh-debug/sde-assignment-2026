@@ -1,7 +1,7 @@
-# Formi Controller — Build Plan (hand this to Claude Code)
+# Formi Controller — Build Plan
 
 Put this file in the repo root next to `docs/SIMULATOR.md`. Work one gate at a time (section 7). Each gate has a
-prompt to paste into Claude Code and a pass/fail check. Don't start a gate until the previous one passes.
+prompt for the coding agent and a pass/fail check. Don't start a gate until the previous one passes.
 
 ---
 
