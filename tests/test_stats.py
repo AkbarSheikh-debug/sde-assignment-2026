@@ -96,3 +96,40 @@ def test_calibrated_threshold_holds_false_alarm_rate_out_of_sample():
 def test_min_detectable_lift_matches_plan_table():
     assert math.isclose(min_detectable_lift(400), 0.16, abs_tol=0.01)
     assert math.isclose(min_detectable_lift(800), 0.113, abs_tol=0.01)
+
+
+def _rollback_day(rng, after_lift, days=10, turn=4, base_lift=0.15):
+    hist, fired = [], None
+    for d in range(days):
+        lift = base_lift if d < turn else after_lift
+        nc, na = rng.poisson(150), rng.poisson(850)            # 15% holdout of ~1000 connected/day
+        hist.append((d, na, rng.binomial(na, min(0.55 * (1 + lift), 0.99)), nc, rng.binomial(nc, 0.55)))
+        l = stratified_lift([x for x in hist if x[0] >= d - P.DECAY_WINDOW_DAYS + 1], d, P.LIFT_HALF_LIFE_DAYS)
+        if fired is None and l.n_ctrl >= P.DECAY_MIN_HOLDOUT and l.p_lt(0.0) > P.DECAY_P:
+            fired = d
+    return fired
+
+
+def test_decay_detection_speed_and_false_rollbacks():
+    """Rollback rule, checked once a day. Winner +15% turns to -10% on day 4: caught within 2 days >= 60%,
+    within 3 days >= 80%, before the turn <= 2%. A stable +5% winner is rolled back by mistake <= 12% of the time
+    over 6 days. (Measured: 66% / 84% / 0.3% / 8%. For a milder turn to -7%: 50% / 68%.)"""
+    rng = np.random.default_rng(77)
+    res = [_rollback_day(rng, -0.10) for _ in range(300)]
+    assert sum(f is not None and f < 4 for f in res) / 300 <= 0.02
+    assert sum(f is not None and 4 <= f <= 5 for f in res) / 300 >= 0.60
+    assert sum(f is not None and 4 <= f <= 6 for f in res) / 300 >= 0.80
+    rng = np.random.default_rng(5)
+    false = [_rollback_day(rng, 0.05, days=6, turn=99, base_lift=0.05) for _ in range(300)]
+    assert sum(f is not None for f in false) / 300 <= 0.12
+
+
+def test_discounting_keeps_aa_false_winners_low():
+    rng = np.random.default_rng(99)
+    false = 0
+    for _ in range(200):
+        strata = [(d, rng.poisson(150), 0, rng.poisson(600), 0) for d in range(4)]
+        strata = [(d, na, rng.binomial(na, 0.55), nc, rng.binomial(nc, 0.55)) for d, na, _, nc, _ in strata]
+        l = stratified_lift(strata, 3, P.LIFT_HALF_LIFE_DAYS)
+        false += winner(l)
+    assert false / 200 <= 0.05

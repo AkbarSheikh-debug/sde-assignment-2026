@@ -58,12 +58,14 @@ class Controller:
     def ingest(self) -> int:
         cur = self.ing.cursor
         chunks = self.c.chunks("history", cur) + self.c.chunks("events", cur)
+        self.s.set_meta("chunks_behind", len(chunks))
         n = 0
         for ch in sorted(chunks, key=lambda c: c["chunk"]):
             if ch["chunk"] <= self.ing.cursor:
                 continue
             self.ing.apply_chunk(ch["chunk"], self.c.chunk_lines(ch["chunk"]), ch["kind"])
             n += ch["events"]
+        self.s.set_meta("chunks_behind", 0)
         return n
 
     def refresh_config(self, wf: str, now: int):
@@ -157,7 +159,15 @@ class Controller:
         eng = EngPlan()
         sp = None
         if routine and inc is None:
-            eng = engagement_plan(ctx)
+            # arm decisions at most every 6h, at a planning tick where the result can be acted on
+            can_act = not self.gov.inflight(wf) and (
+                any(ctx.auto_allows(d) for d in P.ENG_DIMS) or self.gov.can_request(ctx.spec, wf, now, False)[0])
+            last_eval = self.s.get_meta(f"exp_eval_at:{wf}", -10 ** 9)
+            evaluate = can_act and now - last_eval >= P.EXP_EVAL_EVERY_MINUTES
+            eng = engagement_plan(ctx, evaluate=evaluate)
+            if evaluate:
+                with self.s.tx():
+                    self.s.set_meta(f"exp_eval_at:{wf}", now)
             boring = [c for c in eng.arm_changes if c[4] in ("largest share in live config", "already live in config")]
             if boring:
                 with self.s.tx():
@@ -165,7 +175,7 @@ class Controller:
                         self.s.x("INSERT OR IGNORE INTO arms VALUES (?,?,?,?,?,?,?)",
                                  (wf, scope, dim, arm, status, now, reason))
                 eng.arm_changes = [c for c in eng.arm_changes if c not in boring]
-            sp = schedule_plan(ctx)
+            sp = schedule_plan(ctx) if P.SCHEDULE_ENABLED else None
             if sp and (sp.gain < P.SCHEDULE_MIN_GAIN or schedule_is_live(ctx, sp)
                        or ctx.supervisor_touched("schedule", P.SUPERVISOR_RESPECT_HOURS)):
                 sp = None
@@ -213,6 +223,14 @@ class Controller:
         if sp is not None:
             intents.append(Intent("schedule", "schedule", f"Call each group in its best hours ({sp.feature}): "
                                   f"predicted pickup {sp.gain:+.1%} on history", sp.evidence))
+        if any(i.kind == "did_spread" for i in cp.intents) and not cp.urgent:
+            pred = self._pickup_prediction(ctx, self.build(ctx, cp.target, {}, {}, None), None)
+            if pred and pred[0] < -P.CALLER_MAX_PREDICTED_DROP:
+                with self.s.tx():
+                    self.s.decide(wf, now, "blocked", f"safety 8: caller-ID spread predicted to cut pickup "
+                                  f"{pred[0]:+.1%}; keeping the current spread", {"predicted": pred})
+                cp.target = ctx.cfg["allocations"]["default"]["caller_id"]
+                cp.intents = [i for i in cp.intents if i.kind != "did_spread"]
         full = self.build(ctx, cp.target, eng.dists, eng.new_overrides, sp)
         if same(ctx.cfg, full):
             return
@@ -324,10 +342,19 @@ class Controller:
             self.send_auto(ctx, new, [intent], EngPlan(), urgent=True)
         else:
             ok, why = self.gov.can_request(ctx.spec, ctx.wf, ctx.now, urgent=True)
+            if ok and not self.gov.decidable_before_expiry(ctx.spec, ctx.now):
+                ok, why = False, "approver cannot decide before the request would expire; sending when they can"
             if not ok:
-                with self.s.tx():
-                    self.s.decide(ctx.wf, ctx.now, "blocked", f"incident fix waiting: {why}", fix["evidence"])
+                if self.s.get_meta(f"incident_block:{ctx.wf}") != why:     # log once per reason, not every tick
+                    with self.s.tx():
+                        self.s.set_meta(f"incident_block:{ctx.wf}", why)
+                        self.s.decide(ctx.wf, ctx.now, "blocked", f"incident fix waiting: {why}", fix["evidence"])
                 return
+            self.s.set_meta(f"incident_block:{ctx.wf}", None)
+            bad_v = self.credits.validation_for(ctx.wf, fix["bad"]) or {}
+            if bad_v and v:
+                ev["predicted_flag_rate_change"] = round((1 - v["pass_rate"]) - (1 - bad_v["pass_rate"]), 4)
+                ev["validation_of_bad_prompt"] = bad_v.get("validation_run_id")
             pid = self.send_approval(ctx, new, [intent], EngPlan(), None, urgent=True, safety=True, evidence=ev,
                                      incident=fix["incident"])
         if pid:
@@ -356,7 +383,9 @@ class Controller:
         old = ctx.cfg["allocations"]["default"]["caller_id"]
         new = full["allocations"]["default"]["caller_id"]
         if old != new:
-            stats = did_window(ctx, (ctx.now - 72 * 60) // 60)
+            proven = {d for d, st, _ in self.s.q("SELECT did, status, since_minute FROM did_state WHERE wf=?",
+                                                   (ctx.wf,)) if st == "proven"}
+            stats = did_window(ctx, (ctx.now - 72 * 60) // 60, pool=proven or None)
             r = lambda d: stats[d].ratio if d in stats and stats[d].dials >= 100 else 1.0
             pool = sum(old.get(d, 0) * r(d) for d in old) or 1.0
             new_r = sum(new.get(d, 0) * r(d) for d in new)
@@ -412,23 +441,37 @@ class Controller:
                 pre = json.loads(pre_j)
                 with self.s.tx():
                     self.s.x("INSERT OR IGNORE INTO post_apply VALUES (?,?,?,?,?)", (pid, label, wf, now, dumps(post)))
-                    if hrs >= 24:
-                        self._guardrail(wf, pid, pre, post, now)
+                    if hrs == 48:
+                        d24 = self.s.q1("SELECT kpi_json FROM post_apply WHERE proposal_id=? AND window='+24h'", (pid,))
+                        self._guardrail(wf, pid, pre, [json.loads(d24[0]), post] if d24 else [post], now)
 
-    def _guardrail(self, wf: str, pid: str, pre: dict, post: dict, now: int):
+    # which change dims can move which guardrail KPI: welcome/voice are heard only after pickup, so they cannot
+    # move that call's pickup; checking them against pickup only measures the day-to-day drift (F14)
+    ACTS_ON = {"pickup_rate": {"caller_id", "schedule", "cohorts"},
+               "engagement_rate": {"welcome_message", "voice", "prompt_version", "caller_id", "schedule", "cohorts"}}
+
+    def _guardrail(self, wf: str, pid: str, pre: dict, posts: list[dict], now: int):
         spec = self.s.spec(wf)
         g = spec["objective"].get("guardrail") or {}
+        dims = set(json.loads(self.gov.row(pid).get("detail") or "{}").get("dims") or [])
         for key, kpi, num, den in (("pickup_rate_max_drop", "pickup_rate", "connected", "dials"),
                                    ("engagement_rate_max_drop", "engagement_rate", "engaged", "connected")):
-            if key not in g or not pre.get(kpi) or not post.get(kpi):
+            if key not in g or not pre.get(kpi) or not dims & self.ACTS_ON[kpi]:
                 continue
-            drop = (pre[kpi] - post[kpi]) / pre[kpi] if P.GUARDRAIL_RELATIVE else pre[kpi] - post[kpi]
-            n1, n2 = pre[den], post[den]
-            pp = (pre[num] + post[num]) / max(n1 + n2, 1)
-            z = (pre[kpi] - post[kpi]) / max((pp * (1 - pp) * (1 / max(n1, 1) + 1 / max(n2, 1))) ** 0.5, 1e-9)
-            if drop > g[key] and z > 2:
-                self.s.decide(wf, now, "guardrail_breach", f"{kpi} {pre[kpi]:.3f}->{post[kpi]:.3f} after {pid}",
-                              {"pre": pre, "post": post, "z": round(z, 2)}, pid)
+            breaches = []
+            for post in posts:
+                if not post.get(kpi):
+                    break
+                drop = (pre[kpi] - post[kpi]) / pre[kpi] if P.GUARDRAIL_RELATIVE else pre[kpi] - post[kpi]
+                n1, n2 = pre[den], post[den]
+                pp = (pre[num] + post[num]) / max(n1 + n2, 1)
+                z = (pre[kpi] - post[kpi]) / max((pp * (1 - pp) * (1 / max(n1, 1) + 1 / max(n2, 1))) ** 0.5, 1e-9)
+                breaches.append(drop > g[key] and z > P.GUARDRAIL_Z)
+            post = posts[-1]
+            if breaches and all(breaches) and len(breaches) == len(posts):
+                drop = (pre[kpi] - post[kpi]) / pre[kpi]
+                self.s.decide(wf, now, "guardrail_breach", f"{kpi} {pre[kpi]:.3f}->{post[kpi]:.3f} after {pid} "
+                              f"(held at +24h and +48h)", {"pre": pre, "posts": posts, "dims": sorted(dims)}, pid)
                 self.s.alert(wf, now, "GUARDRAIL_BREACH", False, f"{kpi} fell {drop:.1%} after {pid}")
 
 

@@ -41,8 +41,12 @@ class DidStat:
                 "expected": round(self.expected, 1), "ratio": round(self.ratio, 3), "z": round(self.z_below(), 2)}
 
 
-def did_window(ctx: WfCtx, since_hour_idx: int, n_hours: int | None = None) -> dict[str, DidStat]:
-    """Per-DID stats over hour buckets >= since_hour_idx (optionally only the last n dialled hours)."""
+def did_window(ctx: WfCtx, since_hour_idx: int, n_hours: int | None = None,
+               pool: set[str] | None = None) -> dict[str, DidStat]:
+    """Per-DID stats over hour buckets >= since_hour_idx (optionally only the last n dialled hours).
+
+    `pool` = the reference numbers a DID is compared with (default: every other number). A flagged number left
+    in the reference would make a mediocre probe look healthy, so planners pass the proven numbers only."""
     rows = ctx.store.q("SELECT hour_idx, did, dials, conn FROM did_counts WHERE wf=? AND hour_idx>=? "
                        "AND hour_idx < ? ORDER BY hour_idx DESC, did", (ctx.wf, since_hour_idx, ctx.now // 60 + 1))
     by_hour: dict[int, dict[str, tuple[int, int]]] = {}
@@ -52,10 +56,14 @@ def did_window(ctx: WfCtx, since_hour_idx: int, n_hours: int | None = None) -> d
         by_hour.setdefault(h, {})[did] = (n, c)
     tot: dict[str, list] = {}
     for h, cells in by_hour.items():
-        all_n = sum(n for n, _ in cells.values())
-        all_c = sum(c for _, c in cells.values())
+        ref = {d: v for d, v in cells.items() if pool is None or d in pool}
+        all_n = sum(n for n, _ in ref.values())
+        all_c = sum(c for _, c in ref.values())
         for did, (n, c) in cells.items():
-            on, oc = all_n - n, all_c - c
+            on, oc = (all_n - n, all_c - c) if did in ref else (all_n, all_c)
+            if on <= 0:          # nothing proven to compare with (e.g. a single-number pool): use everyone else
+                on = sum(x for d2, (x, _) in cells.items() if d2 != did)
+                oc = sum(y for d2, (_, y) in cells.items() if d2 != did)
             t = tot.setdefault(did, [0, 0, 0.0, 0])
             t[0] += n
             t[1] += c
@@ -72,12 +80,12 @@ def did_window(ctx: WfCtx, since_hour_idx: int, n_hours: int | None = None) -> d
     return out
 
 
-def did_flags(ctx: WfCtx, active: list[str]) -> list[tuple[str, dict]]:
-    """Severely degraded numbers among those currently in use: ratio < 0.6, z > 3, >= 300 dials."""
+def did_flags(ctx: WfCtx, active: list[str], pool: set[str] | None = None) -> list[tuple[str, dict]]:
+    """Severely degraded numbers among those currently in use: ratio < 0.6, z > 5, >= 300 dials."""
     hi = ctx.now // 60
     flagged = []
     for n_hours in (P.DID_FAST_WINDOW_HOURS, P.DID_SLOW_WINDOW_HOURS):
-        stats = did_window(ctx, hi - 48, n_hours)
+        stats = did_window(ctx, hi - 48, n_hours, pool)
         for did in active:
             s = stats.get(did)
             if s and s.dials >= P.DID_FLAG_MIN_DIALS and s.ratio < P.DID_FLAG_RATIO and s.z_below() > P.DID_FLAG_Z:
@@ -107,7 +115,7 @@ def flag_baseline(ctx: WfCtx) -> tuple[float, float]:
 
 
 def calibrate_h(wf: str, p0: float, conn_per_hour: float, hours_per_day: float) -> float:
-    """Smallest h with P(any false alarm within 30 days of clean traffic) <= 10%, by seeded simulation.
+    """Smallest h with P(any false alarm within 30 days of clean traffic) <= 1%, by seeded simulation.
 
     A fixed h is wrong at scale: the null walk has negative drift, but more calls per day means more
     chances to cross. Seeded by the workflow id, so the threshold is reproducible (hard rule 8).
@@ -124,7 +132,7 @@ def calibrate_h(wf: str, p0: float, conn_per_hour: float, hours_per_day: float) 
         _, _, smax = cusum_binomial(((n, int(x)) for x in ks), p0, p0 * P.FLAG_P1_MULT)
         maxima.append(smax)
     maxima.sort()
-    return float(maxima[int(0.9 * (len(maxima) - 1))])
+    return float(maxima[int(P.CUSUM_QUANTILE * (len(maxima) - 1))])
 
 
 def prompt_live_since(ctx: WfCtx) -> int:
@@ -144,7 +152,7 @@ def prompt_live_since(ctx: WfCtx) -> int:
 
 def hallucination_cusum(ctx: WfCtx) -> dict:
     p0, h = flag_baseline(ctx)
-    since = prompt_live_since(ctx)
+    since = max(prompt_live_since(ctx), ctx.store.get_meta(f"cusum_reset:{ctx.wf}", -10 ** 9))
     rows = ctx.store.q("SELECT conn, flag FROM prompt_counts WHERE wf=? AND prompt=? AND hour_idx >= ? "
                        "ORDER BY hour_idx", (ctx.wf, ctx.cfg["prompt_version"], max(since // 60, 0)))
     s, first, _ = cusum_binomial(rows, p0, p0 * P.FLAG_P1_MULT, h)

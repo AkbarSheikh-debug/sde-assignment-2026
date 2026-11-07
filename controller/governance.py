@@ -74,11 +74,26 @@ class Governance:
         mod = now % MIN
         return lo * 60 <= mod < hi * 60 - P.APPROVAL_CLOSE_BUFFER_MIN
 
+    def decidable_before_expiry(self, spec: dict, now: int) -> bool:
+        """Would an approver working `approver_hours` decide a request sent now before its TTL runs out?
+        A request sent at 20:15 with a 12h TTL and approvers back at 10:00 is certain to expire unseen."""
+        g = spec["governance"]
+        lo, hi = g["approver_hours"]
+        worst = now + int(g["approver_latency_minutes"][1])
+        day, mod = divmod(worst, MIN)
+        if mod < lo * 60:
+            worst = day * MIN + lo * 60 + int(g["approver_latency_minutes"][1])
+        elif mod >= hi * 60:
+            worst = (day + 1) * MIN + lo * 60 + int(g["approver_latency_minutes"][1])
+        return worst <= now + int(g["proposal_ttl_hours"]) * 60 - P.EXPIRY_MARGIN_MINUTES
+
     def can_request(self, spec: dict, wf: str, now: int, urgent: bool) -> tuple[bool, str]:
         cap, routine = self.caps(spec)
         used = self.requests_last_24h(wf, now)
         if urgent:
-            return (used + 1 <= cap, f"{used}/{cap} requests used in 24h")
+            # safety fixes use the policy cap; a stakeholder's softer daily limit gives way (and we tell them)
+            pcap = int(spec["governance"]["max_requests_per_24h"])
+            return (used + 1 <= pcap, f"{used}/{pcap} requests used in 24h (policy cap)")
         if not self.routine_window(spec, now):
             return False, "outside routine approval window"
         if used + 1 > routine:

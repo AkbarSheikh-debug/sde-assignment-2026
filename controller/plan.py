@@ -73,7 +73,8 @@ def caller_plan(ctx: WfCtx) -> CallerPlan:
 
     # 1. severe flags on numbers in use -> quarantine (but never shrink the pool below 2)
     fair = 1.0 / max(len(active), 1)
-    for d, ev in did_flags(ctx, active):
+    healthy_ref = {d for d in opts if st[d][0] == "proven"} or None
+    for d, ev in did_flags(ctx, active, healthy_ref):
         if st[d][0] in ("quarantined", "degraded"):
             continue
         if cur.get(d, 0) > P.DID_OVERLOAD_FACTOR * fair:
@@ -91,7 +92,8 @@ def caller_plan(ctx: WfCtx) -> CallerPlan:
 
     # 2. evaluate probes (numbers that are not yet proven) on recent evidence
     since_h = (ctx.now - P.DID_PROBE_LOOKBACK_HOURS * 60) // 60
-    stats = did_window(ctx, since_h)
+    proven = {d for d in opts if st[d][0] == "proven"}
+    stats = did_window(ctx, since_h, pool=proven or None)
     for d in opts:
         s, since = st[d]
         if s not in ("unknown", "reprobe"):
@@ -105,6 +107,10 @@ def caller_plan(ctx: WfCtx) -> CallerPlan:
             set_status(d, "quarantined", "probe severely below pool", ds.as_dict())
         elif ds.dials >= P.DID_PROBE_BAD_MIN_DIALS and ds.z_below(P.DID_HEALTHY_RATIO) > 2.0:
             set_status(d, "quarantined", "probe persistently below 85% of pool", ds.as_dict())
+        else:
+            continue
+        if st[d][0] == "quarantined" and len(pool()) < P.DID_MIN_POOL:     # the floor applies to probes too
+            set_status(d, "degraded", "below pool but needed to keep 2 numbers; reduced share", ds.as_dict())
 
     # 3. quarantine expiry -> small re-probe
     for d in opts:
@@ -180,8 +186,10 @@ def strata(rows, feats: set[int], arm: str, ctrl: str):
     return [(k[0], *v) for k, v in sorted(cells.items())]
 
 
-def lift_of(rows, feats, arm, ctrl) -> Lift | None:
-    return stratified_lift(strata(rows, feats, arm, ctrl))
+def lift_of(rows, feats, arm, ctrl, ref_day: int | None = None) -> Lift | None:
+    """Time-discounted (half-life P.LIFT_HALF_LIFE_DAYS) when ref_day is given; see stats.stratified_lift."""
+    return stratified_lift(strata(rows, feats, arm, ctrl), ref_day, P.LIFT_HALF_LIFE_DAYS if ref_day is not None
+                           else None)
 
 
 def arm_states(ctx: WfCtx) -> dict:
@@ -199,7 +207,10 @@ def _lift_ev(l: Lift | None) -> dict:
             "days": l.days, "p_gt_2pct": round(l.p_gt(P.WIN_DELTA), 4), "p_lt_0": round(l.p_lt(0.0), 4)}
 
 
-def engagement_plan(ctx: WfCtx) -> EngPlan:
+def engagement_plan(ctx: WfCtx, evaluate: bool = True) -> EngPlan:
+    """evaluate=False only finishes what earlier evaluations decided (e.g. a promotion that max_shift split into
+    steps). Arm decisions are evaluated at most every 6h: re-testing nearly the same data every 2 hours multiplies the
+    false-positive rate (prunes, ramps, rollbacks) without making decisions meaningfully faster."""
     plan = EngPlan()
     states = arm_states(ctx)
     budget_new = P.NEW_UNPROVEN_PER_APPLY
@@ -213,6 +224,9 @@ def engagement_plan(ctx: WfCtx) -> EngPlan:
             continue
         rows = arm_rows(ctx, dim, ctx.day - P.EVAL_DAYS + 1)
         recent = arm_rows(ctx, dim, ctx.day - P.DECAY_WINDOW_DAYS + 1)
+        today = [r for r in recent if r[0] == ctx.day]
+        yesterday = [r for r in recent if r[0] == ctx.day - 1]
+        latest = today if sum(r[4] for r in today) >= P.TREND_MIN_CONNECTED_TODAY else yesterday
         overrides = ctx.layout.overrides[dim]
         scopes = ["default"] + overrides
         scopes_by_dim[dim] = scopes
@@ -233,8 +247,8 @@ def engagement_plan(ctx: WfCtx) -> EngPlan:
             shares = {a: cur.get(a, 0.0) for a in opts if a != inc}
             # ---- decay / rollback: does the incumbent still beat the old control it replaced?
             hold = next((a for a in opts if st.get(a) == "holdout"), None)
-            if hold and st.get(inc) == "winner":
-                dl = lift_of(recent, feats, inc, hold)
+            if evaluate and hold and st.get(inc) == "winner":
+                dl = lift_of(recent, feats, inc, hold, ctx.day)
                 if dl and dl.n_ctrl >= P.DECAY_MIN_HOLDOUT and dl.p_lt(0.0) > P.DECAY_P:
                     plan.arm_changes += [(scope, dim, inc, "retired", "decayed below holdout"),
                                          (scope, dim, hold, "control", "restored after rollback")]
@@ -266,46 +280,63 @@ def engagement_plan(ctx: WfCtx) -> EngPlan:
                                                    f"Finish promoting {dim} {inc} in {scope}; {a} held out at "
                                                    f"{P.HOLDOUT_SHARE:.0%}", {}))
                     continue
+                if not evaluate:
+                    continue
                 if s is None:
                     probe_queue.append((opts.index(a), dim, scope, a))
                     continue
-                l = lift_of(rows, feats, a, inc)
+                l = lift_of(rows, feats, a, inc, ctx.day)        # discounted: tracks the current effect
                 if l is None:
                     continue
                 rl = lift_of(recent, feats, a, inc)     # "is it winning *now*": guards against decay onset
-                recent_bad = rl is not None and rl.n_arm >= P.PRUNE_MIN_CONNECTED and rl.p_lt(P.PRUNE_DELTA) > P.PRUNE_P
                 recent_ok = rl is not None and rl.p_gt(0.0) >= P.RECENT_P_POSITIVE
+                ll = lift_of(latest, feats, a, inc)
+                # trend guard: the latest day must not sit clearly below the window average (decay in progress)
+                fading = ll is not None and ll.se > 0 and (l.est - ll.est) / ll.se > P.TREND_Z
+                recent_ok = recent_ok and not fading
                 seg_good = False
                 if scope == "default" and l.n_arm >= P.RAMP_MIN_CONNECTED:
                     for sid, sl, share in _segment_lifts(ctx, rows, feats, a, inc, l):
                         if sl.p_gt(0.0) > 0.8:
                             seg_good = True
+                        # a segment cohort only when the segment stands out from the arm's overall effect;
+                        # if shrinkage pulled it back to the overall lift, it is an overall effect, not a cohort
+                        stands_out = sl.est - l.est > max(l.se, 0.02)
                         if sl.n_arm >= P.SEGMENT_MIN_CONNECTED and sl.n_ctrl >= P.SEGMENT_MIN_CONNECTED \
-                                and sl.days >= P.WIN_MIN_DAYS and sid not in overrides:
+                                and sl.days >= P.WIN_MIN_DAYS and sid not in overrides and stands_out:
                             tests.append((1 - sl.p_gt(P.WIN_DELTA),
                                           {"kind": "segment_promote", "dim": dim, "scope": scope, "seg": sid,
                                            "arm": a, "ctrl": inc, "lift": sl, "share": share}))
-                if ((l.n_arm >= P.PRUNE_MIN_CONNECTED and l.p_lt(P.PRUNE_DELTA) > P.PRUNE_P) or recent_bad) \
-                        and not seg_good:
+                # pruning a good arm is itself a harmful change; keeping a bad one a little longer at a small
+                # share is not a change at all -> prune only on strong evidence (time-discounted estimate)
+                if l.n_arm >= P.PRUNE_MIN_CONNECTED and l.p_lt(P.PRUNE_DELTA) > P.PRUNE_P and not seg_good:
                     shares[a] = 0.0
-                    why = l if not recent_bad else rl
-                    plan.arm_changes.append((scope, dim, a, "pruned", "worse than control"
-                                             + (" in the last 2 days" if recent_bad else "")))
+                    plan.arm_changes.append((scope, dim, a, "pruned", "worse than control"))
                     plan.intents.append(Intent(f"prune:{scope}:{dim}:{a}", "prune",
-                                               f"Stop testing {dim} {a} in {scope}: {why.rel:+.1%} vs {inc}"
-                                               + (" over the last 2 days" if recent_bad else ""), _lift_ev(why)))
+                                               f"Stop testing {dim} {a} in {scope}: {l.rel:+.1%} vs {inc} "
+                                               f"(recent days weighted most)", _lift_ev(l)))
                     continue
                 if l.n_arm >= P.WIN_MIN_CONNECTED and l.n_ctrl >= P.WIN_MIN_CONNECTED and l.days >= P.WIN_MIN_DAYS \
                         and recent_ok:
                     tests.append((1 - l.p_gt(P.WIN_DELTA), {"kind": "promote", "dim": dim, "scope": scope,
                                                              "arm": a, "ctrl": inc, "lift": l, "recent": rl}))
-                if l.n_arm >= P.RAMP_MIN_CONNECTED and l.p_gt(P.RAMP_NOT_WORSE_DELTA) >= P.RAMP_P_NOT_WORSE \
-                        and (rl is None or rl.p_gt(P.RAMP_NOT_WORSE_DELTA) >= 0.5):
+                losing = l.n_arm >= P.RAMP_MIN_CONNECTED and l.p_lt(0.0) > P.DERAMP_P
+                if (fading or losing) and shares.get(a, 0) > P.PROBE_SHARE + 1e-9 and not seg_good:
+                    # graded response: step back to probe share on moderate evidence (a wrong step-down of a good
+                    # arm stays under the harm line); full prune still needs strong evidence
+                    shares[a] = P.PROBE_SHARE
+                    why = (f"latest day {ll.rel:+.1%} vs {l.rel:+.1%} recently (fading)" if fading else
+                           f"{l.rel:+.1%} vs {inc}, P(worse)={l.p_lt(0.0):.2f}")
+                    plan.intents.append(Intent(f"fade:{scope}:{dim}:{a}", "prune",
+                                               f"Reduce {dim} {a} in {scope} to {P.PROBE_SHARE:.0%}: {why}",
+                                               {**_lift_ev(l), "latest": _lift_ev(ll)}))
+                    continue
+                if l.n_arm >= P.RAMP_MIN_CONNECTED and l.p_gt(0.0) >= P.RAMP_P_BETTER and not fading:
                     nxt = next((x for x in P.RAMP_SHARE_STEPS if x > shares.get(a, 0) + 1e-9), None)
                     room = P.MAX_TEST_SHARE - sum(v for k, v in shares.items())
                     if nxt is not None and budget_ramp > 0 and room > 0:
                         add = min(nxt - shares.get(a, 0), budget_ramp, room)
-                        if add > 0.01:
+                        if add >= P.RAMP_MIN_STEP - 1e-9:
                             shares[a] = shares.get(a, 0) + add
                             budget_ramp -= add
                             if s != "ramp":
@@ -326,7 +357,7 @@ def engagement_plan(ctx: WfCtx) -> EngPlan:
         l: Lift = t["lift"]
         if not ok or l.p_gt(P.WIN_DELTA) < P.WIN_P:
             continue
-        key = (t["scope"], t["dim"]) if t["kind"] == "promote" else ("seg", t["dim"], t["seg"])
+        key = (t["scope"], t["dim"]) if t["kind"] == "promote" else ("seg", t["dim"])   # <= 1 new cohort per dim
         if key in winners_done or (t["scope"], t["dim"]) in winners_done:
             continue
         opts = list(ctx.options[t["dim"]])
@@ -414,7 +445,7 @@ def _segment_lifts(ctx: WfCtx, rows, scope_feats: set[int], arm: str, ctrl: str,
         sf = {c for c in scope_feats if ctx.combos[c].get(f) == v}
         if not sf:
             continue
-        raw[sid] = lift_of(rows, sf, arm, ctrl)
+        raw[sid] = lift_of(rows, sf, arm, ctrl, ctx.day)
         shares[sid] = sum(n for _, feat, _, a, n, _ in rows if feat in sf and a in (arm, ctrl)) / total
     shrunk = shrink({k: v for k, v in raw.items() if v is not None}, overall)
     return [(sid, shrunk[sid], shares[sid]) for sid in sorted(shrunk)]

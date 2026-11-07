@@ -151,6 +151,12 @@ def package(ctx: WfCtx, old: dict, new: dict, intents: list, rationale_extra: st
     al, al_detail = affected_leads(ctx, old, new)
     dr = dry_run(ctx, old, new, {"pickup": pickup} if pickup else None)
     dr["affected_detail"] = al_detail
+    if evidence and "predicted_flag_rate_change" in evidence:
+        dr["hallucination_rate_change"] = {"mean": evidence["predicted_flag_rate_change"],
+                                           "basis": "validation runs of the live and the proposed prompt",
+                                           "runs": [evidence.get("validation_of_bad_prompt"),
+                                                    evidence.get("validation_run_id")]}
+        dr["engagement_rate_change"]["note"] = "prompts are not A/B tested live; engagement checked after apply"
     score, why = impact_score(dr, safety)
     dr["impact_score_explained"] = why
     rationale = " | ".join(f"[{i.kind}] {i.summary}" for i in intents)

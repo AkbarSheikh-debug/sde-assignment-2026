@@ -68,13 +68,13 @@ class Credits:
                 self.s.set_meta("credits_remaining", resp.body["credits_remaining"])
         return resp.body
 
-    def validate(self, wf: str, prompt: str, now: int, reason: str, reuse: bool = True) -> dict | None:
+    def validate(self, wf: str, prompt: str, now: int, reason: str, reuse: bool = True, n: int | None = None) -> dict | None:
+        n = n or P.VALIDATION_N
         if reuse:
             prev = self.validation_for(wf, prompt)
-            if prev:
+            if prev and prev.get("n", 0) >= n:
                 return prev
-        n = P.VALIDATION_N
-        return self._op(f"val:{wf}:{prompt}:{now}", wf, now, "validation", reason, -(-n // 100),
+        return self._op(f"val:{wf}:{prompt}:{now}:{n}", wf, now, "validation", reason, -(-n // 100),
                         lambda: self.c.send("POST", "/validation/runs", {"workflow_id": wf, "prompt_version": prompt,
                                                                          "n": n}))
 
@@ -142,10 +142,43 @@ def last_known_good(ctx: WfCtx, exclude: set[str]) -> tuple[str | None, dict]:
     return None, {"record": tried, "baseline_flag_rate": round(p0, 4)}
 
 
+def incident_spend(ctx: WfCtx, inc: dict) -> float:
+    return float(ctx.store.q1("SELECT COALESCE(SUM(cost),0) FROM credit_ops WHERE wf=? AND state='DONE' AND "
+                              "reason='incident' AND minute >= ?", (ctx.wf, inc["opened"]))[0])
+
+
+def confirm_cusum(ctx: WfCtx, credits: Credits, cs: dict) -> tuple[bool, dict]:
+    """A CUSUM alarm alone is weak (flags are noisy). Act only if validation agrees: the live prompt fails the bar
+    or validates clearly worse than the last-known-good prompt."""
+    live = ctx.cfg["prompt_version"]
+    v = credits.validate(ctx.wf, live, ctx.now, "incident", reuse=False, n=P.CONFIRM_VALIDATION_N)
+    ev = {"cusum": cs, "live_validation": v}
+    if v is None:
+        return True, {**ev, "why": "could not validate; treating the alarm as real"}
+    if v["pass_rate"] < bar(ctx):
+        return True, {**ev, "why": "live prompt fails the validation bar"}
+    lkg, rec = last_known_good(ctx, {live})
+    if lkg:
+        lv = credits.validate(ctx.wf, lkg, ctx.now, "incident", n=P.CONFIRM_VALIDATION_N)
+        ev["lkg"] = lkg
+        ev["lkg_validation"] = lv
+        if lv:
+            n1, n2 = v["n"], lv["n"]
+            p = (v["failures"] + lv["failures"]) / (n1 + n2)
+            se = max((p * (1 - p) * (1 / n1 + 1 / n2)) ** 0.5, 1e-9)
+            z = (lv["pass_rate"] - v["pass_rate"]) / se
+            ev["z_vs_lkg"] = round(z, 2)
+            if z > P.CONFIRM_Z:
+                return True, {**ev, "why": f"live prompt validates worse than {lkg} (z={z:.2f})"}
+    return False, {**ev, "why": "validation does not confirm the alarm"}
+
+
 def choose_fix(ctx: WfCtx, credits: Credits, inc: dict) -> tuple[str | None, dict]:
     exclude = {inc["bad"]} | set(inc["detail"].get("failed_fixes", []))
-    spent_before = credits.spent(ctx.wf)
-    budget_left = lambda: P.CREDIT_INCIDENT_MAX - (credits.spent(ctx.wf) - spent_before) - inc["detail"].get("spent", 0)
+    cached = inc["detail"].get("chosen")
+    if cached and cached["prompt"] not in exclude:        # waiting for a request slot is not a reason to re-spend
+        return cached["prompt"], cached["evidence"]
+    budget_left = lambda: P.CREDIT_INCIDENT_MAX - incident_spend(ctx, inc)
     lkg, ev = last_known_good(ctx, exclude)
     if lkg:
         v = credits.validate(ctx.wf, lkg, ctx.now, "incident")
@@ -153,6 +186,8 @@ def choose_fix(ctx: WfCtx, credits: Credits, inc: dict) -> tuple[str | None, dic
         if v and v["pass_rate"] >= bar(ctx):
             return lkg, {**ev, "validation_run_id": v["validation_run_id"], "source": "last_known_good"}
         exclude.add(lkg)
+    if not inc["detail"].get("confirmed", True):
+        return None, {**ev, "why": "unconfirmed alarm: no last-known-good revert available, not asking the LLM"}
     if budget_left() < 3 + 2:
         return None, {**ev, "why": "incident credit cap reached"}
     sug = credits.suggest(ctx.wf, f"hallucination flags high on prompt {inc['bad']}; need a safer prompt that keeps "
@@ -185,11 +220,17 @@ def tick(ctx: WfCtx, credits: Credits) -> dict | None:
     live = ctx.cfg["prompt_version"]
     if inc is None:
         cs = hallucination_cusum(ctx)
-        if cs["alarm"] and cs["connected"] >= 100:
-            start(ctx, live, "cusum", cs)
-            inc = open_incident(ctx)
-        else:
+        if not (cs["alarm"] and cs["connected"] >= 100):
             return None
+        ok, ev = confirm_cusum(ctx, credits, cs)
+        if not ok:
+            with ctx.store.tx():
+                ctx.store.set_meta(f"cusum_reset:{ctx.wf}", ctx.now)
+                ctx.store.decide(ctx.wf, ctx.now, "cusum_unconfirmed", f"flag CUSUM alarm on {live} not confirmed by "
+                                 f"validation ({ev['why']}); statistic reset, prompt left alone", ev)
+            return None
+        start(ctx, live, "cusum+validation", ev)
+        inc = open_incident(ctx)
     if live != inc["bad"] and inc["state"] in ("open", "fix_proposed", "no_fix"):
         # someone (supervisor or an approved fix) already moved off the bad prompt
         with ctx.store.tx():
@@ -234,7 +275,9 @@ def tick(ctx: WfCtx, credits: Credits) -> dict | None:
                 ctx.store.alert(ctx.wf, ctx.now, "INCIDENT_UNFIXED", True,
                                 f"unsafe prompt {inc['bad']} live; no validated fix ({ev.get('why')})")
                 return None
-            ctx.store.decide(ctx.wf, ctx.now, "incident_fix_chosen", f"revert {inc['bad']} -> {fix} ({ev['source']})",
-                             ev)
+            if not inc["detail"].get("chosen"):
+                ctx.store.decide(ctx.wf, ctx.now, "incident_fix_chosen",
+                                 f"revert {inc['bad']} -> {fix} ({ev['source']})", ev)
+                set_incident(ctx.store, inc["id"], detail={**inc["detail"], "chosen": {"prompt": fix, "evidence": ev}})
         return {"incident": inc["id"], "prompt": fix, "evidence": ev, "bad": inc["bad"]}
     return None

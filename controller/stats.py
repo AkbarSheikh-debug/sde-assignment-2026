@@ -40,9 +40,14 @@ class Lift:
         return math.expm1(self.est - z * self.se), math.expm1(self.est + z * self.se)
 
 
-def stratified_lift(strata) -> Lift | None:
-    """strata: iterable of (day, n_arm, e_arm, n_ctrl, e_ctrl). Strata missing either side are skipped."""
-    sw = swy = 0.0
+def stratified_lift(strata, ref_day: int | None = None, half_life_days: float | None = None) -> Lift | None:
+    """strata: iterable of (day, n_arm, e_arm, n_ctrl, e_ctrl). Strata missing either side are skipped.
+
+    With ref_day/half_life_days, a stratum `age` days old gets weight 0.5**(age/half_life) on top of its
+    inverse variance, so the estimate tracks the *current* effect of an arm whose effect moves (decay).
+    The variance accounts for the weights: var = sum(a_i^2 v_i) / (sum a_i)^2. Counts stay raw.
+    """
+    sa = say = sa2v = 0.0
     na = nc = 0
     days = set()
     for day, n_a, e_a, n_c, e_c in strata:
@@ -51,15 +56,17 @@ def stratified_lift(strata) -> Lift | None:
         pa = (e_a + 1.0) / (n_a + 2.0)
         pc = (e_c + 1.0) / (n_c + 2.0)
         var = (1 - pa) / (pa * (n_a + 2.0)) + (1 - pc) / (pc * (n_c + 2.0))
-        w = 1.0 / var
-        sw += w
-        swy += w * math.log(pa / pc)
+        disc = 0.5 ** (max(ref_day - day, 0) / half_life_days) if ref_day is not None and half_life_days else 1.0
+        a = disc / var
+        sa += a
+        say += a * math.log(pa / pc)
+        sa2v += a * a * var
         na += n_a
         nc += n_c
         days.add(day)
-    if sw == 0:
+    if sa == 0:
         return None
-    return Lift(swy / sw, math.sqrt(1.0 / sw), na, nc, len(days))
+    return Lift(say / sa, math.sqrt(sa2v) / sa, na, nc, len(days))
 
 
 def shrink(segments: dict[str, Lift], overall: Lift) -> dict[str, Lift]:
