@@ -1,7 +1,9 @@
 # Outcome-First Agent Loop — Submission
 
-**Name:** _(fill in)_ · **Date:** 2026-11-07 · **Hours actually spent:** _(fill in honestly)_ (built with an AI
-coding assistant; every number re-run) · **Language / storage:** Python 3.10+ (httpx + stdlib; numpy only for seeded CUSUM
+**Name:** Akbar Arif · **Date:** 8 Nov 2026 · **Hours actually spent:** ~10 — about 6–7 h planning and research
+(deciding what to include and how), then about 3–4 h with an AI coding agent that built the implementation from my
+plan; the agent's work was then re-run and its numbers checked. (I was on a borrowed laptop; on my own machine the
+build would likely have taken 1–2 h.) · **Language / storage:** Python 3.10+ (httpx + stdlib; numpy only for seeded CUSUM
 calibration), SQLite (WAL), no other services.
 
 Every number below is copied from a file in `reports/` (named next to it). Nothing here is about the hidden scenarios.
