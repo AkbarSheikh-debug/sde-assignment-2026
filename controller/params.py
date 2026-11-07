@@ -34,6 +34,7 @@ CUSUM_H_HISTORY_MULT = 1.5       # h = max(min, 1.5 x the largest statistic seen
 LKG_MIN_CONNECTED = 500           # a prompt needs this many live calls to count as "known good"
 LKG_FLAG_MARGIN = 0.006           # flag rate <= baseline + 0.6pp counts as clean
 FIX_VERIFY_CONNECTED = 300        # calls after a fix before we judge it
+FIX_FAIL_Z = 2.33                 # a fix "failed" only if flags are above baseline at 1% one-sided
 CREDIT_INCIDENT_RESERVE_SHARE = 0.5  # half the budget is kept for incidents
 CREDIT_INCIDENT_MAX = 15          # one incident may not burn more than this
 STRICT_PROMPT_WORDS = ("verbatim", "strict", "word for word", "word-for-word")  # Anita: kills engagement

@@ -26,9 +26,9 @@ log = logging.getLogger("controller")
 
 
 def run(sim_url: str, db: str, plan_only: bool = False, view_port: int | None = None, max_ticks: int | None = None,
-        quiet: bool = False) -> dict:
+        quiet: bool = False, transport=None) -> dict:
     store = Store(db)
-    client = SimClient(sim_url)
+    client = SimClient(sim_url, transport=transport)
     ctl = Controller(store, client, plan_only=plan_only)
     ctl.bootstrap()
     if view_port:

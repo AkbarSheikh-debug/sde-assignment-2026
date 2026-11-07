@@ -36,6 +36,7 @@ class Resp:
 
 class SimClient:
     def __init__(self, base_url: str, timeout: float = 120.0, transport=None, sleep=time.sleep):
+        # transport is injectable so tests can drive an in-process simulator and inject faults
         self.http = httpx.Client(base_url=base_url.rstrip("/"), timeout=timeout, transport=transport)
         self._sleep = sleep
         self.requests_sent = 0

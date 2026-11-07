@@ -1,0 +1,79 @@
+# Small world for fast tests: one approval-only next_campaign_only workflow, one auto-apply workflow, a bad
+# supervisor prompt and a flagged caller ID. Same schema as the public scenarios.
+name: tiny_test
+seed: 7
+days: 4
+history_days: 4
+tick_minutes: 15
+credits: 60
+tenants:
+  - id: northwind_life
+    workflows:
+      - id: t_kyc
+        use_case: test kyc
+        language_mix: {en: 0.6, hi: 0.4}
+        dialling_window: [10, 20]
+        dials_per_hour: 120
+        daily_batch: {size: 400, at_hour: 8, returning_share: 0.2}
+        cadence: [2, 2]
+        base_pickup: 0.34
+        base_engage: 0.6
+        mid_flight: next_campaign_only
+        options:
+          welcome_message: [W1, W2]
+          voice: [V1, V2]
+          caller_id: [D1, D2, D3]
+          prompt_version: [P1, P3]
+        default_config:
+          allocations:
+            default: {welcome_message: {W1: 1}, voice: {V1: 1}, caller_id: {D1: 1}}
+          prompt_version: P1
+        objective: {primary: pickup_rate, guardrail: {engagement_rate_max_drop: 0.02}}
+        governance:
+          auto_apply: {enabled: false, allowed_dims: [], max_shift: 0}
+          approver_hours: [10, 18]
+          approver_latency_minutes: [30, 90]
+          proposal_ttl_hours: 24
+          apply_window_hours: 2
+          max_requests_per_24h: 2
+          base_reject_rate: 0.0
+  - id: kestrel_finance
+    workflows:
+      - id: t_cancel
+        use_case: test cancel
+        language_mix: {hi: 0.6, en: 0.4}
+        dialling_window: [9, 21]
+        dials_per_hour: 200
+        daily_batch: {size: 700, at_hour: 8, returning_share: 0.3}
+        cadence: [2, 2]
+        base_pickup: 0.28
+        base_engage: 0.5
+        mid_flight: allowed
+        options:
+          welcome_message: [W1, W2, W3]
+          voice: [V1, V2]
+          caller_id: [D1, D2, D3]
+          prompt_version: [P1, P2, P3]
+        default_config:
+          allocations:
+            default: {welcome_message: {W1: 1}, voice: {V1: 1}, caller_id: {D1: 0.5, D2: 0.5}}
+          prompt_version: P1
+        objective: {primary: engagement_rate, guardrail: {pickup_rate_max_drop: 0.02}}
+        governance:
+          auto_apply: {enabled: true, allowed_dims: [schedule, caller_id, welcome_message, voice], max_shift: 0.2}
+          approver_hours: [10, 19]
+          approver_latency_minutes: [20, 60]
+          proposal_ttl_hours: 12
+          apply_window_hours: 2
+          max_requests_per_24h: 4
+          base_reject_rate: 0.0
+prompts:
+  P1: {summary: "Current production prompt", halluc: 0.006, engage_mult: 1.0}
+  P2: {summary: "Supervisor edit: urgency language", halluc: 0.06, engage_mult: 0.93}
+  P3: {summary: "Grounded", halluc: 0.004, engage_mult: 1.03}
+# ---- hidden ground truth
+effects:
+  - {workflow: t_cancel, dim: welcome_message, value: W2, mult: 1.2}
+incidents:
+  - {type: did_flagged, workflow: t_cancel, did: D2, at: "D1 10:00", base_health: 0.3}
+  - {type: supervisor_edit, workflow: t_cancel, at: "D2 11:30", patch: {prompt_version: P2}}

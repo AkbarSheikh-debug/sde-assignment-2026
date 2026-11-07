@@ -9,3 +9,7 @@ grade:
 	mkdir -p reports && python -m sim grade --run runs/mine_$(NAME) --baseline runs/base_$(NAME) --out reports/$(NAME).md
 test:
 	python -m pytest -q tests
+check:
+	python -m pytest -q -p no:warnings tests
+run:
+	./scripts/run_scenario.sh $(NAME)

@@ -203,7 +203,10 @@ def tick(ctx: WfCtx, credits: Credits) -> dict | None:
         n, k, e = r
         p0, _ = flag_baseline(ctx)
         if n >= P.FIX_VERIFY_CONNECTED:
-            ok = k / n <= p0 + P.LKG_FLAG_MARGIN
+            # fail only if clearly above the clean baseline: at 300 calls a clean prompt exceeds
+            # "baseline + margin" by chance ~1 time in 6, so a point comparison would reject good fixes
+            z = (k - n * p0) / max((n * p0 * (1 - p0)) ** 0.5, 1e-9)
+            ok = z <= P.FIX_FAIL_Z
             with ctx.store.tx():
                 if ok:
                     set_incident(ctx.store, inc["id"], state="resolved", closed_minute=ctx.now)
