@@ -50,14 +50,28 @@ def run(sim_url: str, db: str, plan_only: bool = False, view_port: int | None = 
         if store.get_meta("last_decided", -10 ** 9) < now:
             t_dec = time.time()
             ctl.step(now)
+            day_stats = store.get_meta("day_stats", {})
+            ds = day_stats.setdefault(str(now // 1440), {"ticks": 0, "events": 0, "ingest_s": 0.0, "decide_s": 0.0,
+                                                         "max_tick_decide_s": 0.0})
+            dec = time.time() - t_dec
+            ds["ticks"] += 1; ds["events"] += n
+            ds["ingest_s"] = round(ds["ingest_s"] + ingest_s, 3); ds["decide_s"] = round(ds["decide_s"] + dec, 3)
+            ds["max_tick_decide_s"] = round(max(ds["max_tick_decide_s"], dec), 3)
             with store.tx():
+                store.set_meta("day_stats", day_stats)
                 store.set_meta("last_decided", now)
                 store.set_meta("loop_stats", {"sim_minute": now, "ingest_s": round(ingest_s, 3),
                                               "decide_s": round(time.time() - t_dec, 3), "events": n,
                                               "requests": client.requests_sent})
         if now % 1440 == 0 and not quiet:
             log.info("%s day %d: %d events ingested so far, %.1fs wall", st["ts"], now // 1440, events, time.time() - t0)
+        t_adv = time.time()
         client.advance(P.TICK_MINUTES)
+        adv_s = time.time() - t_adv          # the simulator's own compute, not ours
+        stats = store.get_meta("day_stats", {})
+        if str(now // 1440) in stats:
+            stats[str(now // 1440)]["sim_advance_s"] = round(stats[str(now // 1440)].get("sim_advance_s", 0) + adv_s, 3)
+            store.set_meta("day_stats", stats)
         ticks += 1
         if max_ticks is not None and ticks >= max_ticks:
             break

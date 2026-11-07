@@ -50,13 +50,11 @@ def affected_leads(ctx: WfCtx, old: dict, new: dict) -> tuple[int, dict]:
     feats = touched_feats(ctx, old, new)
     dims = changed_dims(old, new)
     cad = len(ctx.spec["cadence"])
-    rows = ctx.store.q(
-        "SELECT l.feat, COUNT(*) FROM leads l JOIN campaigns c ON c.campaign_id=l.campaign "
-        "WHERE l.wf=? AND c.minute >= ? AND NOT EXISTS (SELECT 1 FROM calls k WHERE k.wf=l.wf AND "
-        "k.lead_idx=l.lead_idx AND k.engaged=1) GROUP BY l.feat", (ctx.wf, (ctx.day - cad + 1) * 1440))
+    rows = ctx.store.q("SELECT feat, SUM(leads - concluded) FROM camp_counts WHERE wf=? AND cday >= ? GROUP BY feat",
+                       (ctx.wf, ctx.day - cad + 1))
     active = sum(n for f, n in rows if f in feats)
-    mix = ctx.store.q("SELECT l.feat, COUNT(*) FROM leads l JOIN campaigns c ON c.campaign_id=l.campaign "
-                      "WHERE l.wf=? AND c.minute >= ? GROUP BY l.feat", (ctx.wf, (ctx.day - 3) * 1440))
+    mix = ctx.store.q("SELECT feat, SUM(leads) FROM camp_counts WHERE wf=? AND cday >= ? GROUP BY feat",
+                      (ctx.wf, ctx.day - 3))
     tot = sum(n for _, n in mix) or 1
     share = sum(n for f, n in mix if f in feats) / tot
     tomorrow = int(round(ctx.spec["daily_batch"]["size"] * share))

@@ -25,9 +25,10 @@ CREATE TABLE IF NOT EXISTS campaigns (campaign_id TEXT PRIMARY KEY, wf TEXT, min
     config_version INTEGER);
 
 -- one row per dial from D0 on: answers "what did this customer hear, and under which config"
+-- clustered on (wf, lead, attempt): one B-tree, no secondary index; "explain --lead" is a range read
 CREATE TABLE IF NOT EXISTS calls (wf TEXT, minute INTEGER, lead_idx INTEGER, attempt INTEGER, cfg_ver INTEGER,
-    cohort TEXT, wm TEXT, voice TEXT, did TEXT, prompt TEXT, connected INTEGER, engaged INTEGER, flag INTEGER);
-CREATE INDEX IF NOT EXISTS calls_lead ON calls (wf, lead_idx);
+    cohort TEXT, wm TEXT, voice TEXT, did TEXT, prompt TEXT, connected INTEGER, engaged INTEGER, flag INTEGER,
+    PRIMARY KEY (wf, lead_idx, attempt)) WITHOUT ROWID;
 
 -- engagement by arm: connected calls only (welcome/voice act after pickup)
 CREATE TABLE IF NOT EXISTS arm_counts (wf TEXT, day INTEGER, feat INTEGER, cohort TEXT, dim TEXT, arm TEXT,
@@ -38,6 +39,9 @@ CREATE TABLE IF NOT EXISTS hour_counts (wf TEXT, day INTEGER, feat INTEGER, hour
     conn INTEGER, PRIMARY KEY (wf, day, feat, hour)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS prompt_counts (wf TEXT, hour_idx INTEGER, prompt TEXT, conn INTEGER, eng INTEGER,
     flag INTEGER, PRIMARY KEY (wf, hour_idx, prompt)) WITHOUT ROWID;
+-- leads uploaded / concluded per campaign day and feature combo: active-lead counts without scanning calls
+CREATE TABLE IF NOT EXISTS camp_counts (wf TEXT, cday INTEGER, feat INTEGER, leads INTEGER, concluded INTEGER,
+    PRIMARY KEY (wf, cday, feat)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS day_kpi (wf TEXT, day INTEGER, dials INTEGER, conn INTEGER, eng INTEGER,
     flag INTEGER, PRIMARY KEY (wf, day)) WITHOUT ROWID;
 

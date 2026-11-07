@@ -43,6 +43,7 @@ class Ingestor:
         self.tp = TimeParser()
         self.combos: dict[tuple, int] = {}
         self.lead_feat: dict[str, array] = defaultdict(lambda: array("H"))
+        self.lead_cday: dict[str, array] = defaultdict(lambda: array("h"))   # campaign day per lead
         self.events_ingested = 0
         self._load()
 
@@ -50,14 +51,17 @@ class Ingestor:
     def _load(self):
         for code, *vals in self.s.q("SELECT code, lang, city_tier, age_band, value_band FROM feat_combos"):
             self.combos[tuple(vals)] = code
-        for wf, idx, feat in self.s.q("SELECT wf, lead_idx, feat FROM leads ORDER BY wf, lead_idx"):
-            self._set_feat(wf, idx, feat)
+        camp_day = {c: m // 1440 for c, m in self.s.q("SELECT campaign_id, minute FROM campaigns")}
+        for wf, idx, feat, camp in self.s.q("SELECT wf, lead_idx, feat, campaign FROM leads ORDER BY wf, lead_idx"):
+            self._set_feat(wf, idx, feat, camp_day.get(camp, 0))
 
-    def _set_feat(self, wf: str, idx: int, feat: int):
-        a = self.lead_feat[wf]
+    def _set_feat(self, wf: str, idx: int, feat: int, cday: int):
+        a, d = self.lead_feat[wf], self.lead_cday[wf]
         if idx >= len(a):
             a.extend([NO_FEAT] * (idx + 1 - len(a)))
+            d.extend([0] * (idx + 1 - len(d)))
         a[idx] = feat
+        d[idx] = cday
 
     @property
     def cursor(self) -> int:
@@ -92,7 +96,9 @@ class Ingestor:
                     self.combos[key] = code
                     new_combos.append((code, *key))
                 li = idx_of(ev["lead_id"], "l")
-                self._set_feat(ev["workflow_id"], li, code)
+                cday = minute_of(ev["ts"]) // 1440
+                self._set_feat(ev["workflow_id"], li, code, cday)
+                acc.camp[(ev["workflow_id"], cday, code)][0] += 1
                 acc.leads.append((ev["workflow_id"], li, code, idx_of(ev["person_id"], "p"), ev["campaign_id"]))
             elif t == "campaign_created":
                 acc.campaigns.append((ev["campaign_id"], ev["workflow_id"], minute_of(ev["ts"]), ev["leads"],
@@ -138,6 +144,8 @@ class Ingestor:
                 c[0] += 1; c[1] += eng
             p = acc.prompt[(wf, hidx, v["prompt_version"])]
             p[0] += 1; p[1] += eng; p[2] += flag
+        if eng and li < len(a):
+            acc.camp[(wf, self.lead_cday[wf][li], feat)][1] += 1
         if minute >= 0:
             acc.calls.append((wf, minute, li, ev["attempt_no"], ev["config_version"], cohort,
                               v["welcome_message"], v["voice"], v["caller_id"], v["prompt_version"],
@@ -152,6 +160,7 @@ class _Acc:
         self.hour = defaultdict(z2)
         self.prompt = defaultdict(lambda: [0, 0, 0])
         self.day_kpi = defaultdict(lambda: [0, 0, 0, 0])
+        self.camp = defaultdict(lambda: [0, 0])
         self.leads: list[tuple] = []
         self.calls: list[tuple] = []
         self.campaigns: list[tuple] = []
@@ -159,7 +168,7 @@ class _Acc:
     def flush(self, db):
         db.executemany("INSERT OR IGNORE INTO leads VALUES (?,?,?,?,?)", self.leads)
         db.executemany("INSERT OR IGNORE INTO campaigns VALUES (?,?,?,?,?)", self.campaigns)
-        db.executemany("INSERT INTO calls VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", self.calls)
+        db.executemany("INSERT OR IGNORE INTO calls VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", self.calls)
         db.executemany(
             "INSERT INTO arm_counts VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(wf,day,feat,cohort,dim,arm) "
             "DO UPDATE SET conn=conn+excluded.conn, eng=eng+excluded.eng",
@@ -176,6 +185,10 @@ class _Acc:
             "INSERT INTO prompt_counts VALUES (?,?,?,?,?,?) ON CONFLICT(wf,hour_idx,prompt) "
             "DO UPDATE SET conn=conn+excluded.conn, eng=eng+excluded.eng, flag=flag+excluded.flag",
             [(*k, *v) for k, v in self.prompt.items()])
+        db.executemany(
+            "INSERT INTO camp_counts VALUES (?,?,?,?,?) ON CONFLICT(wf,cday,feat) "
+            "DO UPDATE SET leads=leads+excluded.leads, concluded=concluded+excluded.concluded",
+            [(*k, *v) for k, v in self.camp.items()])
         db.executemany(
             "INSERT INTO day_kpi VALUES (?,?,?,?,?,?) ON CONFLICT(wf,day) DO UPDATE SET "
             "dials=dials+excluded.dials, conn=conn+excluded.conn, eng=eng+excluded.eng, flag=flag+excluded.flag",
