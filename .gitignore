@@ -7,3 +7,4 @@ state/
 *.db-wal
 *.db-shm
 .pytest_cache/
+.DS_Store

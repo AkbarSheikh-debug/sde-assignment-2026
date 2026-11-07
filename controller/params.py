@@ -53,7 +53,7 @@ RAMP_SHARE_STEPS = (0.12, 0.20)   # ramp ladder; each step <= 8 points so a wron
 RAMP_MIN_STEP = 0.05              # smaller ramps aren't worth an approver's attention
 RAMP_PER_APPLY = 0.12             # share moved onto ramping arms per apply (they passed "not worse")
 MAX_TEST_SHARE = 0.60             # incumbent keeps >= 40% of every scope while testing
-RAMP_MIN_CONNECTED = 250          # calls on an arm before it may ramp
+RAMP_MIN_CONNECTED = 150          # calls on an arm before it may ramp
 RAMP_P_BETTER = 0.80              # P(lift > 0) needed to ramp (0.6-0.7 ramped bad arms on noise in fuzz worlds)
 PRUNE_MIN_CONNECTED = 250
 DERAMP_P = 0.80                   # P(lift < 0) above this -> step back to probe share (cheap if wrong)
@@ -100,3 +100,12 @@ GUARDRAIL_RELATIVE = True         # read "max_drop: 0.02" as relative (stricter)
 STAKEHOLDER_OVERLAYS = {
     "kestrel_finance": {"max_requests_per_day": 2, "earliest_hour": 11},   # Anita, memo 04
 }
+
+# Ablation runs only (never set by run.sh): CONTROLLER_PARAM_OVERRIDES='{"SCHEDULE_ENABLED": true}'
+import json as _json
+import os as _os
+
+for _k, _v in _json.loads(_os.environ.get("CONTROLLER_PARAM_OVERRIDES", "{}")).items():
+    if _k not in globals():
+        raise KeyError(f"unknown param override {_k}")
+    globals()[_k] = _v
